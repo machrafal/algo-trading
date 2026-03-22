@@ -159,3 +159,114 @@ class DataLoader:
         combined.index = pd.to_datetime(combined.index)
         combined.sort_index(inplace=True)
         return combined
+
+
+# ---------------------------------------------------------------------------------------------------------
+# 2. Data Cleaner
+# ---------------------------------------------------------------------------------------------------------
+
+
+class MarketDataCleaner:
+    """
+    Financial data cleaning
+
+    Extends DataCleaner class with methods specific to OHLCV / returns.
+
+    Incorporate patterns from:
+    - data-cleaning-and-preparation.py (interpolation, Savitzky-Golay)
+    - noisy-financial-data.py          (missing values, measurement error)
+    """
+
+    def __init__(self, prices: pd.DataFrame, verbose: bool = True):
+        """
+        Params
+        prices: pd.DataFrame
+        price matrix (rows = dates, columns = tickers)
+        """
+        self.prices = prices.copy()
+        self.verbose = verbose
+        self._report_quality(prices)
+
+    def _report_quality(self, prices: pd.DataFrame):
+        """
+        Print data quality summary
+        """
+        missing = prices.isnan().sum()
+        total = len(prices)
+        if self.verbose:
+            print("\n-----------Data Quality Report---------------")
+            for col in prices.columns:
+                pct = missing[col] / total * 100
+                status = "ok" if pct == 0 else f"{pct:.1f}% missing"
+                print(f"{col < 8} {total} rows {status}")
+            print(f"Data range: {prices.index[0].date()} {prices.index[-1].date()}")
+            print("---------------------------------------------\n")
+
+    def fill_missing(self, method: str = "linear") -> "MarketDataCleaner":
+        """
+        Fill missing prices
+        Uses lineaer interpolation
+        Falls back to forward-fill then backward-fill for edge cases.
+        """
+        before = self.prices.isna().sum().sum()
+        self.prices = self.prices.interpolate(method=method, limit_area="both")
+        self.prices = self.prices.ffill().bfill()
+        after = self.prices.isna().sum().sum()
+        if self.verbose and before > 0:
+            print(f"fill_missing: {before} NaN -> {after} NaN (method={method})")
+        return self
+
+    def remove_outliers(
+        self,
+        z_threshold: float = 5.0,
+    ) -> "MarketDataCleaner":
+        """
+        Replace daily return outliers (|z| > threshold) with NaN, then re-interpolate.
+        Addresses measurement noise from noisy-financial-data.py.
+        """
+        returns = self.prices.pct_change()
+        z = (returns - returns.mean()) / returns.std()
+        mask = z.abs() > z_threshold
+
+        if self.verbose:
+            n_outliers = mask.sum().sum()
+            if n_outliers > 0:
+                print(
+                    f"remove outliers: {n_outliers} outlier returns"
+                    f"(|z| > {z_threshold}) replaced"
+                )
+
+        # Replace outlier prices with NaN then re-interpolate
+        # Flag price at t when return at t (=price[t]/price[t-1] is outlier)
+        price_mask = mask.fillna(False)
+        self.prices = self.prices.where(~price_mask, other=np.nan)
+        self.prices = self.prices.interpolate(method="linear", limit_direction="both")
+        return self
+
+    def align_to_common_dates(self) -> "MarketDataCleaner":
+        """
+        Drop dates where ANY ticker has missing data after filling.
+        """
+        before = len(self.prices)
+        self.prices = self.prices.dropna()
+        after = len(self.prices)
+        if self.verbose and before != after:
+            print(
+                f"aglin_dates: {before} -> {after} rows."
+                f"({before - after} dates dropped)"
+            )
+        return self
+
+    def get_prices(self) -> pd.DataFrame:
+        return self.prices.copy()
+
+    def get_returns(self, log: bool = True) -> pd.DataFrame:
+        """
+        Compute daily returns
+        Params:
+        log: bool
+        If True, log returns (default). Else simple returns.
+        """
+        if log:
+            return np.log(self.prices / self.prices.shift(1)).dropna()
+        return self.prices.pct_change().dropna()
