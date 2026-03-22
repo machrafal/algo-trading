@@ -270,3 +270,85 @@ class MarketDataCleaner:
         if log:
             return np.log(self.prices / self.prices.shift(1)).dropna()
         return self.prices.pct_change().dropna()
+
+
+# ---------------------------------------------------------------------------------------------------------
+# 3. Feature Builder
+# ---------------------------------------------------------------------------------------------------------
+
+
+class FeatureBuilder:
+    """
+    Computes features used as inputs to regime detection and alpha singnals
+
+    Connects to signal-independence.py (IC, z-scores) and alternative-to-skew-kurt.py
+    (higher moment features)
+    """
+
+    def __init__(self, returns: pd.DataFrame):
+        self.returns = returns
+
+    def realized_vol(self, window: int = 21) -> pd.DataFrame:
+        """
+        Annualized rolling realized volatility.
+        """
+        return self.returns.rolling(window).std() * np.sqrt(252)
+
+    def z_score(self, window: int = 63) -> pd.DataFrame:
+        """
+        Rolling z-score of returns.
+        """
+        mu = self.returns.rolling(window).mean()
+        sig = self.returns.rolling(window).std()
+        return (self.returns - mu) / sig
+
+    def momentum(self, lookback: int = 63, skip: int = 5) -> pd.DataFrame:
+        """
+        Cross-sectional momentum signal (skip most recent 'skip' days).
+        """
+        return self.returns.shift(skip).rolling(lookback).sum()
+
+    def rolling_skew(self, window: int = 63) -> pd.DataFrame:
+        """
+        Rolling skewness.
+        """
+        return self.returns.rolling(window).skew()
+
+    def rolling_kurt(self, window: int = 63) -> pd.DataFrame:
+        """
+        Rolling excess kurtosis.
+        """
+        return self.returns.rolling(window).kurt()
+
+    def vol_ratio(self, short: int = 5, long: int = 21) -> pd.DataFrame:
+        """
+        Short-term vs long-term vol ratio.
+        > 1 = vol expanding (regime change signal)
+        < 1 = vol contracting (mean-reverting regime)
+        """
+        vol_s = self.returns.rolling(short).std()
+        vol_l = self.returns.rolling(long).std()
+        return vol_s / vol_l
+
+    def build_all(self) -> pd.DataFrame:
+        """
+        Build a flat feature matrix for one ticker or the full universe.
+        Returns MultiIndex or single-ticker DataFrame
+        """
+        tickers = self.returns.columns
+        feature_frames = {}
+
+        for t in tickers:
+            r = self.returns[[t]]
+            feat = pd.DataFrame(index=r.index)
+            feat["ret_1d"] = r[t]
+            feat["vol_21d"] = self.realized_vol(21)[t]
+            feat["vol_63d"] = self.realized_vol(63)[t]
+            feat["vol_ratio"] = self.vol_ratio(5, 21)[t]
+            feat["z_score_63d"] = self.z_score(63)[t]
+            feat["momentum_63d"] = self.momentum(63)[t]
+            feat["skew_63d"] = self.rolling_skew(63)[t]
+            feat["kurt_63d"] = self.rolling_kurt(63)[t]
+            feature_frames[t] = feat
+
+        return pd.concat(feature_frames, axis=1)
