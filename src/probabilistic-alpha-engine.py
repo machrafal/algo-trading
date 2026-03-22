@@ -1,12 +1,13 @@
 import warnings
 
-warnings.filterwarnings("ignore")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats
 from scipy.signal import savgol_filter
 from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
 
 try:
     from pandas_datareader import data as pdr
@@ -352,3 +353,131 @@ class FeatureBuilder:
             feature_frames[t] = feat
 
         return pd.concat(feature_frames, axis=1)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# 4. Pipeline
+# ---------------------------------------------------------------------------------------------------------
+
+
+def main():
+    print("-" * 50)
+    print("probabilistic-alpha-engine")
+    print("-" * 50)
+
+    # 1) Load data
+    print("\n[1/4] Loading market data from Stooq...")
+    loader = DataLoader(source="stooq", verbose=True)
+
+    # Load GPW universe
+    prices = loader.get_universe(ticker_dict=GPW_TICKERS, start="2015-01-01")
+
+    # Load WIG20 index as benchmark
+    wig20 = loader.get_ohlcv(WIG20_TICKER, start="2015-01-01")
+
+    # 2) Clean the data
+    print("\n[2/4] Cleaning price data...")
+    cleaner = (
+        MarketDataCleaner(prices, verbose=True)
+        .fill_missing(method="linear")
+        .remove_outliers(z_threshold=5.0)
+        .align_to_common_dates()
+    )
+
+    clean_prices = cleaner.get_prices()
+    log_returns = cleaner.get_returns(log=True)
+    simple_returns = cleaner.get_returns(log=False)
+
+    print(
+        f"\nFinal universe: {clean_prices.shape[1]} tickers, "
+        f"{clean_prices.shape[0]} trading days"
+    )
+
+    # 3) Build features
+    print("\n[3/4] Building features...")
+    builder = FeatureBuilder(log_returns)
+    features = builder.build_all()
+
+    # Summary stats
+    print("\nFeature summary (last available row, PKN):")
+    if "PKN" in features.columns.get_level_values(0):
+        print(features["PKN"].tail(1).T.to_string())
+
+    # 4) Save and plot
+    print("\n[4/4] Saving outputs and generating charts...")
+
+    clean_prices.to_csv("data_prices.csv")
+    log_returns.to_csv("data_log_returns.csv")
+    features.to_csv("data_features.csv")
+    print("Saved: data_prices.csv, data_log_returns.csv, data_features.csv")
+
+    # Plots
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    fig.suptitle("Market Data Pipeline - GPW Universe", fontsize=10)
+
+    # Plot 1: Normalized price series
+    ax = axes[0, 0]
+    (clean_prices / clean_prices.iloc[0] * 100).plot(
+        ax=ax, alpha=0.8, lindewidth=1.2, legend=True
+    )
+    ax.set_title("Normalized prices (base = 100)")
+    ax.legend(fontsize=7, ncol=2)
+
+    # Plot 2: Rolling realised volatility (21d)
+    ax = axes[0, 1]
+    vol = builder.realized_vol(21)
+    vol.plot(ax=ax, alpha=0.7, linewidth=1.0, legend=True)
+    ax.set_title("Realized volatility - 21d rolling (annualized)")
+    ax.set_ylabel("Volatility")
+    ax.axhline(
+        vol.mean().mean(),
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+        label="Cross-sectional mean",
+    )
+    ax.legend(fontsize=7, ncol=2)
+
+    # Plot 3: Return distribution (cross-sectional)
+    ax = axes[1, 0]
+    all_rets = log_returns.values.flatten()
+    all_rets = all_rets[~np.isnan(all_rets)]
+    ax.hist(
+        all_rets, bins=100, density=True, alpha=0.7, color="skyblue", edgecolor="none"
+    )
+    # Overly normal
+    mu, sigma = all_rets.mean(), all_rets.std()
+    x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 300)
+    ax.plot(x, stats.norm.pdf(x, mu, sigma), "r--", linewidth=1.5, label="Normal")
+    ax.set_title("Log-return distribution - GPW universe")
+    ax.set_xlabel("Log returns")
+    ax.set_ylabel("Density")
+    ax.legend()
+
+    # Plot 4: Vol ratio heatmap (regime signal preview)
+    ax = axes[1, 1]
+    vr = builder.vol_ratio(5, 21).tail(252)  # last year
+    im = ax.imshow(
+        vr.T.values,
+        aspect="auto",
+        cmap="coolwarm",
+        vmin=0.5,
+        vmax=2.0,
+        interpolation="nearest",
+    )
+    ax.set_yticks(range(len(vr.columns)))
+    ax.set_yticklabels(vr.columns, fontsize=8)
+    n_ticks = 6
+    step = max(1, len(vr) // n_ticks)
+    ax.set_xticks(range(0, len(vr), step))
+    ax.set_xticklabels(
+        [str(d.date()) for d in vr.index[::step]], rotation=30, fontsize=7
+    )
+    plt.colorbar(im, ax=ax, label="Vol ratio (>1 = expanding)")
+    ax.set_title("Vol ration heatmap - regime change preview")
+
+    plt.tight_layout()
+
+    print("\n" + "-" * 50)
+
+    return clean_prices, log_returns, features
